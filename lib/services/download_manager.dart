@@ -4,6 +4,7 @@ import 'dart:isolate';
 
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/download_item.dart';
@@ -37,15 +38,23 @@ class DownloadManager {
   static const String _downloadParameter = 'download';
   static const String _downloadParameterValue = '1';
   static const String _fileSeparator = '-';
+  static const int _copyBufferSize = 65536;
+  static const String _storageChannelName = 'download_manager/storage';
+  static const String _publishFileMethod = 'publishFileToDownloads';
+  static const String _sourcePathArgument = 'sourcePath';
+  static const String _fileNameArgument = 'fileName';
+
+  static const MethodChannel _storageChannel = MethodChannel(
+    _storageChannelName,
+  );
 
   final Map<String, ReceivePort> _receivePorts = <String, ReceivePort>{};
   final Map<String, StreamSubscription<dynamic>> _receiveSubscriptions =
       <String, StreamSubscription<dynamic>>{};
 
-  /// Adds a remote URL download and starts its background isolate.
+  /// Adds a remote URL download as a pending item with its own stream.
   Future<DownloadItem> addDownload({
     required String url,
-    required DownloadItemChanged onItemChanged,
   }) async {
     final Uri? parsedUri = Uri.tryParse(url.trim());
     if (!_isSupportedUri(parsedUri)) {
@@ -68,15 +77,26 @@ class DownloadManager {
       startedAt: DateTime.now(),
     );
 
-    final Directory appDirectory = await getApplicationDocumentsDirectory();
-    final String savePath =
-        '${appDirectory.path}${Platform.pathSeparator}$id$_fileSeparator$fileName';
+    return item;
+  }
+
+  /// Starts the background isolate for a pending download item.
+  Future<void> startDownload({
+    required DownloadItem item,
+    required DownloadItemChanged onItemChanged,
+  }) async {
+    if (item.status != DownloadStatus.pending) {
+      return;
+    }
+
+    final String resolvedUrl = resolveDownloadUrl(item.url);
+    final String savePath = await _buildTemporarySavePath(item);
     final ReceivePort receivePort = ReceivePort();
-    _receivePorts[id] = receivePort;
+    _receivePorts[item.id] = receivePort;
 
     final StreamSubscription<dynamic> subscription = receivePort.listen(
-      (dynamic message) {
-        _handleIsolateMessage(
+      (dynamic message) async {
+        await _handleIsolateMessage(
           item: item,
           message: message,
           onItemChanged: onItemChanged,
@@ -86,29 +106,40 @@ class DownloadManager {
         _markItemAsError(item, onItemChanged);
       },
     );
-    _receiveSubscriptions[id] = subscription;
+    _receiveSubscriptions[item.id] = subscription;
 
     try {
       item.status = DownloadStatus.downloading;
-      item.isolateRef = await Isolate.spawn<Map<String, dynamic>>(
-        _downloadTask,
-        <String, dynamic>{
-          'url': resolvedUrl,
-          'sendPort': receivePort.sendPort,
-          'savePath': savePath,
-        },
-        onError: receivePort.sendPort,
-        onExit: receivePort.sendPort,
-      );
+      if (_isSupportedUri(Uri.tryParse(item.url))) {
+        item.isolateRef = await Isolate.spawn<Map<String, dynamic>>(
+          _downloadTask,
+          <String, dynamic>{
+            'url': resolvedUrl,
+            'sendPort': receivePort.sendPort,
+            'savePath': savePath,
+          },
+          onError: receivePort.sendPort,
+          onExit: receivePort.sendPort,
+        );
+      } else {
+        item.isolateRef = await Isolate.spawn<Map<String, dynamic>>(
+          _copyFileTask,
+          <String, dynamic>{
+            'sourcePath': item.url,
+            'sendPort': receivePort.sendPort,
+            'savePath': savePath,
+          },
+          onError: receivePort.sendPort,
+          onExit: receivePort.sendPort,
+        );
+      }
       onItemChanged(item);
-      return item;
     } catch (error) {
       _markItemAsError(item, onItemChanged);
-      return item;
     }
   }
 
-  /// Adds a selected local file as an already completed item.
+  /// Adds a selected local file as a pending item ready to be copied.
   DownloadItem addLocalFile(String filePath) {
     final String id = _uuid.v4();
     final String fallbackName = StringUtils.get('unknownFileName');
@@ -118,14 +149,11 @@ class DownloadManager {
       id: id,
       fileName: FileUtils.getFileName(filePath, fallbackName),
       url: filePath,
-      progress: _completedProgress,
-      status: DownloadStatus.completed,
+      progress: _initialProgress,
+      status: DownloadStatus.pending,
       streamController: streamController,
-      localFilePath: filePath,
       startedAt: DateTime.now(),
     );
-    streamController.add(_completedProgress);
-    streamController.close();
     return item;
   }
 
@@ -182,11 +210,11 @@ class DownloadManager {
   }
 
   /// Handles structured messages emitted by a download isolate.
-  void _handleIsolateMessage({
+  Future<void> _handleIsolateMessage({
     required DownloadItem item,
     required dynamic message,
     required DownloadItemChanged onItemChanged,
-  }) {
+  }) async {
     if (message is List<dynamic>) {
       _markItemAsError(item, onItemChanged);
       return;
@@ -212,9 +240,14 @@ class DownloadManager {
     }
 
     if (messageType == _completedMessage) {
+      final String temporaryPath = message[_messagePathKey] as String;
+      final String publishedPath = await _publishFileToDeviceDownloads(
+        temporaryPath: temporaryPath,
+        fileName: item.fileName,
+      );
       item.progress = _completedProgress;
       item.status = DownloadStatus.completed;
-      item.localFilePath = message[_messagePathKey] as String?;
+      item.localFilePath = publishedPath;
       if (!item.streamController.isClosed) {
         item.streamController.sink.add(_completedProgress);
       }
@@ -250,6 +283,37 @@ class DownloadManager {
     if (!item.streamController.isClosed) {
       item.streamController.close();
     }
+  }
+
+  /// Builds the temporary path used by isolates before public publishing.
+  Future<String> _buildTemporarySavePath(DownloadItem item) async {
+    final Directory saveDirectory = await getTemporaryDirectory();
+    await saveDirectory.create(recursive: true);
+    return '${saveDirectory.path}${Platform.pathSeparator}${item.id}$_fileSeparator${item.fileName}';
+  }
+
+  /// Publishes a completed temporary file to the device Downloads folder.
+  Future<String> _publishFileToDeviceDownloads({
+    required String temporaryPath,
+    required String fileName,
+  }) async {
+    try {
+      final String? publishedPath = await _storageChannel.invokeMethod<String>(
+        _publishFileMethod,
+        <String, String>{
+          _sourcePathArgument: temporaryPath,
+          _fileNameArgument: fileName,
+        },
+      );
+
+      if (publishedPath != null && publishedPath.isNotEmpty) {
+        return publishedPath;
+      }
+    } catch (_) {
+      // Keep the temporary file path if the platform cannot publish publicly.
+    }
+
+    return temporaryPath;
   }
 
   /// Checks whether a URI can be downloaded by this manager.
@@ -311,6 +375,73 @@ class DownloadManager {
       });
     } finally {
       client.close();
+    }
+  }
+
+  /// Copies a local file in a background isolate and reports progress by port.
+  @pragma('vm:entry-point')
+  static Future<void> _copyFileTask(Map<String, dynamic> arguments) async {
+    final String sourcePath = arguments['sourcePath'] as String;
+    final SendPort sendPort = arguments['sendPort'] as SendPort;
+    final String savePath = arguments['savePath'] as String;
+
+    RandomAccessFile? sourceFile;
+    IOSink? outputSink;
+
+    try {
+      final File inputFile = File(sourcePath);
+      if (!await inputFile.exists()) {
+        throw FileSystemException('Source file not found', sourcePath);
+      }
+
+      final File outputFile = File(savePath);
+      await outputFile.parent.create(recursive: true);
+
+      final int totalBytes = await inputFile.length();
+      int copiedBytes = 0;
+      sourceFile = await inputFile.open();
+      outputSink = outputFile.openWrite();
+
+      while (copiedBytes < totalBytes) {
+        final int remainingBytes = totalBytes - copiedBytes;
+        final int readLength = remainingBytes < _copyBufferSize
+            ? remainingBytes
+            : _copyBufferSize;
+        final List<int> chunk = await sourceFile.read(readLength);
+        if (chunk.isEmpty) {
+          break;
+        }
+
+        copiedBytes += chunk.length;
+        outputSink.add(chunk);
+
+        final double progress = totalBytes == 0
+            ? _completedProgress
+            : copiedBytes / totalBytes;
+        sendPort.send(<String, dynamic>{
+          _messageTypeKey: _progressMessage,
+          _messageProgressKey: progress,
+        });
+      }
+
+      await outputSink.flush();
+      await outputSink.close();
+      outputSink = null;
+      await sourceFile.close();
+      sourceFile = null;
+
+      sendPort.send(<String, dynamic>{
+        _messageTypeKey: _completedMessage,
+        _messagePathKey: savePath,
+      });
+    } catch (error) {
+      sendPort.send(<String, dynamic>{
+        _messageTypeKey: _errorMessage,
+        _messageErrorKey: error.toString(),
+      });
+    } finally {
+      await outputSink?.close();
+      await sourceFile?.close();
     }
   }
 }

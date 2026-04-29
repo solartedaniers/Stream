@@ -13,6 +13,9 @@ class DownloadProvider extends ChangeNotifier {
       : _downloadManager = downloadManager ?? DownloadManager();
 
   static const String _downloadStartedKey = 'downloadStarted';
+  static const String _downloadQueuedKey = 'downloadQueued';
+  static const String _pendingDownloadsStartedKey = 'pendingDownloadsStarted';
+  static const String _noPendingDownloadsKey = 'noPendingDownloads';
   static const String _invalidUrlKey = 'invalidUrl';
   static const String _emptyUrlMessageKey = 'emptyUrlMessage';
   static const String _localFileAddedKey = 'localFileAdded';
@@ -28,7 +31,7 @@ class DownloadProvider extends ChangeNotifier {
         _downloads,
       );
 
-  /// Starts a new remote download from a URL and returns a message key.
+  /// Adds a new remote URL to the pending download list.
   Future<String> startDownload(String url) async {
     if (url.trim().isEmpty) {
       return _emptyUrlMessageKey;
@@ -37,27 +40,74 @@ class DownloadProvider extends ChangeNotifier {
     try {
       final DownloadItem item = await _downloadManager.addDownload(
         url: url,
-        onItemChanged: _updateItem,
       );
       _downloads.insert(0, item);
       notifyListeners();
-      return _downloadStartedKey;
+      return _downloadQueuedKey;
     } catch (error) {
       return _invalidUrlKey;
     }
   }
 
+  /// Starts a single pending download item.
+  Future<String> beginDownload(DownloadItem item) async {
+    if (item.status != DownloadStatus.pending) {
+      return _downloadStartedKey;
+    }
+
+    await _downloadManager.startDownload(
+      item: item,
+      onItemChanged: _updateItem,
+    );
+    notifyListeners();
+    if (item.status == DownloadStatus.error) {
+      return _invalidUrlKey;
+    }
+    return _downloadStartedKey;
+  }
+
+  /// Starts every pending download currently in the list.
+  Future<String> beginPendingDownloads() async {
+    final List<DownloadItem> pendingItems = _downloads
+        .where((DownloadItem item) => item.status == DownloadStatus.pending)
+        .toList();
+
+    if (pendingItems.isEmpty) {
+      return _noPendingDownloadsKey;
+    }
+
+    for (final DownloadItem item in pendingItems) {
+      await _downloadManager.startDownload(
+        item: item,
+        onItemChanged: _updateItem,
+      );
+    }
+
+    notifyListeners();
+    return _pendingDownloadsStartedKey;
+  }
+
   /// Opens a file picker and adds the selected local file to the list.
   Future<String> pickLocalFile() async {
     try {
-      final FilePickerResult? result = await FilePicker.platform.pickFiles();
-      final String? path = result?.files.single.path;
-      if (path == null || path.isEmpty) {
+      final FilePickerResult? result = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+      );
+      final List<String> selectedPaths = result?.files
+              .map((PlatformFile file) => file.path)
+              .whereType<String>()
+              .where((String path) => path.isNotEmpty)
+              .toList() ??
+          <String>[];
+
+      if (selectedPaths.isEmpty) {
         return _filePickerErrorKey;
       }
 
-      final DownloadItem item = _downloadManager.addLocalFile(path);
-      _downloads.insert(0, item);
+      final List<DownloadItem> selectedItems = selectedPaths
+          .map((String path) => _downloadManager.addLocalFile(path))
+          .toList();
+      _downloads.insertAll(0, selectedItems);
       notifyListeners();
       return _localFileAddedKey;
     } catch (error) {

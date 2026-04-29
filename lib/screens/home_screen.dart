@@ -22,7 +22,7 @@ class _HomeScreenState extends State<HomeScreen> {
   static const double _sectionSpacing = 16;
   static const double _inputSpacing = 8;
   static const double _emptyIconSize = 72;
-  static const String _downloadStartedKey = 'downloadStarted';
+  static const String _downloadQueuedKey = 'downloadQueued';
 
   final TextEditingController _urlController = TextEditingController();
 
@@ -45,8 +45,9 @@ class _HomeScreenState extends State<HomeScreen> {
             children: <Widget>[
               _DownloadInput(
                 controller: _urlController,
-                onAddDownload: _startDownload,
+                onAddDownload: _queueDownload,
                 onPickFile: _pickLocalFile,
+                onStartPendingDownloads: _startPendingDownloads,
               ),
               const SizedBox(height: _sectionSpacing),
               Expanded(
@@ -60,18 +61,61 @@ class _HomeScreenState extends State<HomeScreen> {
                       return const _EmptyState();
                     }
 
-                    return ListView.builder(
-                      semanticChildCount: provider.downloads.length,
-                      itemCount: provider.downloads.length,
-                      itemBuilder: (BuildContext context, int index) {
-                        final DownloadItem item = provider.downloads[index];
-                        return DownloadTile(
-                          item: item,
-                          statusLabel: provider.getStatusLabel(item.status),
-                          onCancel: () => _confirmCancel(item),
-                          onOpenFile: () => _openFile(item),
-                        );
-                      },
+                    final List<DownloadItem> activeItems = provider.downloads
+                        .where(
+                          (DownloadItem item) =>
+                              item.status != DownloadStatus.completed,
+                        )
+                        .toList();
+                    final List<DownloadItem> completedItems = provider.downloads
+                        .where(
+                          (DownloadItem item) =>
+                              item.status == DownloadStatus.completed,
+                        )
+                        .toList();
+
+                    return ListView(
+                      children: <Widget>[
+                        _SectionTitle(
+                          title: StringUtils.get('activeDownloads'),
+                        ),
+                        if (activeItems.isEmpty)
+                          _SectionMessage(
+                            message: StringUtils.get('noPendingDownloads'),
+                          )
+                        else
+                          ...activeItems.map(
+                            (DownloadItem item) => DownloadTile(
+                              item: item,
+                              statusLabel: provider.getStatusLabel(
+                                item.status,
+                              ),
+                              onStartDownload: () => _startSingleDownload(item),
+                              onCancel: () => _confirmCancel(item),
+                              onOpenFile: () => _openFile(item),
+                            ),
+                          ),
+                        const SizedBox(height: _sectionSpacing),
+                        _SectionTitle(
+                          title: StringUtils.get('downloadedFiles'),
+                        ),
+                        if (completedItems.isEmpty)
+                          _SectionMessage(
+                            message: StringUtils.get('noDownloadedFiles'),
+                          )
+                        else
+                          ...completedItems.map(
+                            (DownloadItem item) => DownloadTile(
+                              item: item,
+                              statusLabel: provider.getStatusLabel(
+                                item.status,
+                              ),
+                              onStartDownload: () => _startSingleDownload(item),
+                              onCancel: () => _confirmCancel(item),
+                              onOpenFile: () => _openFile(item),
+                            ),
+                          ),
+                      ],
                     );
                   },
                 ),
@@ -83,17 +127,39 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /// Starts a remote download using the provider.
-  Future<void> _startDownload() async {
+  /// Adds a remote download to the pending list using the provider.
+  Future<void> _queueDownload() async {
     final DownloadProvider provider = context.read<DownloadProvider>();
     final String messageKey = await provider.startDownload(_urlController.text);
     if (!mounted) {
       return;
     }
     _showMessage(messageKey);
-    if (messageKey == _downloadStartedKey) {
+    if (messageKey == _downloadQueuedKey) {
       _urlController.clear();
     }
+  }
+
+  /// Starts all pending downloads using their stream controllers.
+  Future<void> _startPendingDownloads() async {
+    final String messageKey = await context
+        .read<DownloadProvider>()
+        .beginPendingDownloads();
+    if (!mounted) {
+      return;
+    }
+    _showMessage(messageKey);
+  }
+
+  /// Starts one pending download from its tile action.
+  Future<void> _startSingleDownload(DownloadItem item) async {
+    final String messageKey = await context
+        .read<DownloadProvider>()
+        .beginDownload(item);
+    if (!mounted) {
+      return;
+    }
+    _showMessage(messageKey);
   }
 
   /// Adds a local file selected through the provider.
@@ -157,6 +223,50 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
+/// Renders a compact title for a download list section.
+class _SectionTitle extends StatelessWidget {
+  /// Creates a section title.
+  const _SectionTitle({required this.title});
+
+  /// Localized section title.
+  final String title;
+
+  /// Builds the title text.
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: _HomeScreenState._inputSpacing),
+      child: Text(
+        title,
+        style: Theme.of(context).textTheme.titleMedium,
+      ),
+    );
+  }
+}
+
+/// Renders a short message inside an empty section.
+class _SectionMessage extends StatelessWidget {
+  /// Creates a section empty message.
+  const _SectionMessage({required this.message});
+
+  /// Localized section message.
+  final String message;
+
+  /// Builds the message text.
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        vertical: _HomeScreenState._inputSpacing,
+      ),
+      child: Text(
+        message,
+        style: Theme.of(context).textTheme.bodyMedium,
+      ),
+    );
+  }
+}
+
 /// Renders the URL input and action buttons.
 class _DownloadInput extends StatelessWidget {
   /// Creates the top input area for adding downloads.
@@ -164,6 +274,7 @@ class _DownloadInput extends StatelessWidget {
     required this.controller,
     required this.onAddDownload,
     required this.onPickFile,
+    required this.onStartPendingDownloads,
   });
 
   /// Controller for the URL input.
@@ -174,6 +285,9 @@ class _DownloadInput extends StatelessWidget {
 
   /// Callback that opens the local file picker.
   final VoidCallback onPickFile;
+
+  /// Callback that starts every pending download.
+  final VoidCallback onStartPendingDownloads;
 
   /// Builds the input controls.
   @override
@@ -191,9 +305,18 @@ class _DownloadInput extends StatelessWidget {
             border: const OutlineInputBorder(),
             suffixIcon: IconButton(
               onPressed: onAddDownload,
-              tooltip: StringUtils.get('addDownload'),
-              icon: const Icon(Icons.download),
+              tooltip: StringUtils.get('addToList'),
+              icon: const Icon(Icons.playlist_add),
             ),
+          ),
+        ),
+        const SizedBox(height: _HomeScreenState._inputSpacing),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            onPressed: onStartPendingDownloads,
+            icon: const Icon(Icons.download),
+            label: Text(StringUtils.get('startPendingDownloads')),
           ),
         ),
         const SizedBox(height: _HomeScreenState._inputSpacing),

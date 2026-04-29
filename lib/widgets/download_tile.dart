@@ -10,6 +10,7 @@ class DownloadTile extends StatelessWidget {
   const DownloadTile({
     required this.item,
     required this.statusLabel,
+    required this.onStartDownload,
     required this.onCancel,
     required this.onOpenFile,
     super.key,
@@ -29,6 +30,9 @@ class DownloadTile extends StatelessWidget {
   /// Localized status label provided by the state layer.
   final String statusLabel;
 
+  /// Callback invoked when the pending download should start.
+  final VoidCallback onStartDownload;
+
   /// Callback invoked when the cancel action is confirmed.
   final VoidCallback onCancel;
 
@@ -39,7 +43,7 @@ class DownloadTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final FileTypeInfo fileTypeInfo = FileUtils.getFileTypeInfo(
-      item.localFilePath ?? item.fileName,
+      item.fileName,
     );
 
     return AnimatedContainer(
@@ -115,6 +119,7 @@ class DownloadTile extends StatelessWidget {
                           child: _TileActions(
                             key: ValueKey<DownloadStatus>(item.status),
                             status: item.status,
+                            onStartDownload: onStartDownload,
                             onCancel: onCancel,
                             onOpenFile: onOpenFile,
                           ),
@@ -160,6 +165,7 @@ class _TileActions extends StatelessWidget {
   /// Creates the action row for a download tile.
   const _TileActions({
     required this.status,
+    required this.onStartDownload,
     required this.onCancel,
     required this.onOpenFile,
     super.key,
@@ -167,6 +173,9 @@ class _TileActions extends StatelessWidget {
 
   /// Current item status.
   final DownloadStatus status;
+
+  /// Callback for starting a pending download.
+  final VoidCallback onStartDownload;
 
   /// Callback for cancellation.
   final VoidCallback onCancel;
@@ -177,6 +186,17 @@ class _TileActions extends StatelessWidget {
   /// Builds the state-specific action buttons.
   @override
   Widget build(BuildContext context) {
+    if (status == DownloadStatus.pending) {
+      return Align(
+        alignment: Alignment.centerRight,
+        child: FilledButton.icon(
+          onPressed: onStartDownload,
+          icon: const Icon(Icons.download),
+          label: Text(StringUtils.get('startDownload')),
+        ),
+      );
+    }
+
     if (status == DownloadStatus.downloading) {
       return Align(
         alignment: Alignment.centerRight,
